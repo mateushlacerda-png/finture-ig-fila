@@ -1,0 +1,41 @@
+name: Publicar no Instagram
+
+on:
+  schedule:
+    # A cada 15 min, das 9h as 20h45 de Brasilia (12h-23h UTC). O cron do GitHub costuma atrasar
+    # alguns minutos; o post sai na primeira rodada depois do horario marcado.
+    - cron: '*/15 12-23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publicar posts vencidos
+        run: node publicar.js
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      - name: Registrar resultado na fila
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A fila
+          if ! git diff --cached --quiet; then
+            git commit -m "fila: resultado da publicacao"
+            git pull --rebase origin main
+            git push origin main
+          fi
