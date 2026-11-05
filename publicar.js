@@ -1,6 +1,7 @@
 // Publica no Instagram os posts da fila cujo horario ja chegou. Roda no GitHub Actions.
 //
 // fila/<pasta>/post.json   { rotulo, publicar_em, imagens: [...jpg], legenda }
+//                          story: { tipo: 'story', rotulo, ancora, publicar_em, imagens: ['story.jpg'] }, sem legenda
 // fila/<pasta>/publicado.json  gravado depois que sai (impede publicar duas vezes)
 // fila/<pasta>/erro.json       tentativas que falharam; desiste depois de MAX_TENTATIVAS
 //
@@ -53,10 +54,21 @@ async function jaNoPerfil(legenda) {
   return data.find((m) => (m.caption || '').trim() === alvo);
 }
 
+// Story nao tem legenda para comparar. Rede de seguranca: um story ativo publicado depois do horario
+// marcado conta como este. Risco aceito: um story manual postado nesse intervalo, numa rodada que
+// tinha falhado, faria este ser dado como publicado (fica registrado com recuperado: true).
+async function storyJaNoPerfil(publicarEm) {
+  const { data = [] } = await api('GET', `${USER}/stories`, { fields: 'id,permalink,timestamp' });
+  const desde = Date.parse(publicarEm);
+  return data.find((m) => Date.parse(String(m.timestamp).replace(/([+-]d{2})(d{2})$/, '$1:$2')) >= desde);
+}
+
 async function publicar(pasta, post) {
   const base = `https://raw.githubusercontent.com/${REPO}/${process.env.GITHUB_SHA}/fila/${pasta}/`;
   let criacao;
-  if (post.imagens.length === 1) {
+  if (post.tipo === 'story') {
+    ({ id: criacao } = await api('POST', `${USER}/media`, { image_url: base + post.imagens[0], media_type: 'STORIES' }));
+  } else if (post.imagens.length === 1) {
     ({ id: criacao } = await api('POST', `${USER}/media`, { image_url: base + post.imagens[0], caption: post.legenda }));
   } else {
     const filhos = [];
@@ -71,7 +83,8 @@ async function publicar(pasta, post) {
   }
   await aguardarContainer(criacao);
   const { id } = await api('POST', `${USER}/media_publish`, { creation_id: criacao });
-  const { permalink } = await api('GET', id, { fields: 'permalink' });
+  // Story pode nao devolver permalink; o registro nao depende dele.
+  const { permalink = null } = await api('GET', id, { fields: 'permalink' }).catch(() => ({}));
   return { media_id: id, permalink };
 }
 
@@ -91,7 +104,7 @@ async function publicar(pasta, post) {
     if (erro.tentativas >= MAX_TENTATIVAS) continue;
 
     try {
-      const existente = await jaNoPerfil(post.legenda);
+      const existente = post.tipo === 'story' ? await storyJaNoPerfil(post.publicar_em) : await jaNoPerfil(post.legenda);
       const r = existente
         ? { media_id: existente.id, permalink: existente.permalink, recuperado: true }
         : await publicar(pasta, post);
