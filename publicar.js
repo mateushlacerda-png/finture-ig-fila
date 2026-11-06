@@ -1,6 +1,8 @@
 // Publica no Instagram os posts da fila cujo horario ja chegou. Roda no GitHub Actions.
 //
 // fila/<pasta>/post.json   { rotulo, publicar_em, imagens: [...jpg], legenda }
+//                          reel: { tipo: 'reel', rotulo, publicar_em, video: 'video.mp4', capa: 'capa.jpg',
+//                                  imagens: ['video.mp4', 'capa.jpg'] (apagados depois), legenda }
 //                          story: { tipo: 'story', rotulo, ancora, publicar_em, imagens: ['story.jpg'] }, sem legenda
 // fila/<pasta>/publicado.json  gravado depois que sai (impede publicar duas vezes)
 // fila/<pasta>/erro.json       tentativas que falharam; desiste depois de MAX_TENTATIVAS
@@ -36,14 +38,25 @@ async function api(metodo, caminho, params = {}) {
 }
 
 // O container precisa estar FINISHED antes de entrar no carrossel ou ser publicado.
-async function aguardarContainer(id) {
-  for (let i = 0; i < 30; i++) {
-    const { status_code: s } = await api('GET', id, { fields: 'status_code' });
+// Video (Reel) leva mais: o Instagram transcodifica antes de liberar.
+async function aguardarContainer(id, tentativas = 30) {
+  for (let i = 0; i < tentativas; i++) {
+    const { status_code: s, status } = await api('GET', id, { fields: 'status_code,status' });
     if (s === 'FINISHED') return;
-    if (s === 'ERROR' || s === 'EXPIRED') throw new Error(`container ${id} ficou ${s}`);
+    if (s === 'ERROR' || s === 'EXPIRED') throw new Error(`container ${id} ficou ${s}${status ? ' (' + status + ')' : ''}`);
     await espera(4000);
   }
-  throw new Error(`container ${id} nao ficou pronto em 2 min`);
+  throw new Error(`container ${id} nao ficou pronto em ${Math.round(tentativas * 4 / 60)} min`);
+}
+
+// Reel: o Instagram baixa o MP4 pela URL do raw.githubusercontent, como faz com as imagens.
+// Testado em 06/11/2026 sem publicar: container FINISHED em ~20 s. O upload resumable (rupload)
+// devolveu ProcessingFailedError nesta conta e foi descartado.
+async function criarReel(base, post) {
+  const params = { media_type: 'REELS', video_url: base + post.video, caption: post.legenda, share_to_feed: 'true' };
+  if (post.capa) params.cover_url = base + post.capa;
+  const { id } = await api('POST', `${USER}/media`, params);
+  return id;
 }
 
 // Rede de seguranca: se uma rodada anterior publicou mas nao conseguiu gravar o publicado.json,
@@ -66,7 +79,10 @@ async function storyJaNoPerfil(publicarEm) {
 async function publicar(pasta, post) {
   const base = `https://raw.githubusercontent.com/${REPO}/${process.env.GITHUB_SHA}/fila/${pasta}/`;
   let criacao;
-  if (post.tipo === 'story') {
+  if (post.tipo === 'reel') {
+    criacao = await criarReel(base, post);
+    await aguardarContainer(criacao, 150); // ate 10 min; o job tem 15
+  } else if (post.tipo === 'story') {
     ({ id: criacao } = await api('POST', `${USER}/media`, { image_url: base + post.imagens[0], media_type: 'STORIES' }));
   } else if (post.imagens.length === 1) {
     ({ id: criacao } = await api('POST', `${USER}/media`, { image_url: base + post.imagens[0], caption: post.legenda }));
