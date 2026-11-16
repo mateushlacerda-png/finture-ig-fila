@@ -4,10 +4,13 @@
 //                          reel: { tipo: 'reel', rotulo, publicar_em, video: 'video.mp4', capa: 'capa.jpg',
 //                                  imagens: ['video.mp4', 'capa.jpg'] (apagados depois), legenda }
 //                          story: { tipo: 'story', rotulo, ancora, publicar_em, imagens: ['story.jpg'] }, sem legenda
+//                          linkedin: { tipo: 'linkedin', rotulo, ancora, publicar_em, documento: 'carrossel.pdf',
+//                                      imagens: ['carrossel.pdf'] (apagado depois), titulo, legenda }
 // fila/<pasta>/publicado.json  gravado depois que sai (impede publicar duas vezes)
 // fila/<pasta>/erro.json       tentativas que falharam; desiste depois de MAX_TENTATIVAS
 //
 // Env: IG_ACCESS_TOKEN, IG_USER_ID (secrets do repo), GITHUB_REPOSITORY, GITHUB_SHA.
+//      LI_ACCESS_TOKEN, LI_ORG_URN (secrets, renovados toda sexta pelo linkedin-token.js local).
 
 const fs = require('fs');
 const path = require('path');
@@ -73,7 +76,74 @@ async function jaNoPerfil(legenda) {
 async function storyJaNoPerfil(publicarEm) {
   const { data = [] } = await api('GET', `${USER}/stories`, { fields: 'id,permalink,timestamp' });
   const desde = Date.parse(publicarEm);
-  return data.find((m) => Date.parse(String(m.timestamp).replace(/([+-]d{2})(d{2})$/, '$1:$2')) >= desde);
+  return data.find((m) => Date.parse(String(m.timestamp).replace(/([+-]\d{2})(\d{2})$/, '$1:$2')) >= desde);
+}
+
+// ---------------------------------------------------------------------------------------------
+// LinkedIn (desde 2026-11-16): pagina da Finture, post de documento (o carrossel em PDF), pela
+// Community Management API. O PDF sobe do proprio checkout, sem URL publica.
+const LI_TOKEN = process.env.LI_ACCESS_TOKEN;
+const LI_ORG = process.env.LI_ORG_URN; // urn:li:organization:NNN
+const LI_VERSAO = process.env.LI_VERSION || '202610'; // cada versao vale ~1 ano; ver README
+const LI_API = 'https://api.linkedin.com/rest';
+
+async function li(metodo, caminho, corpo, extra = {}) {
+  if (!LI_TOKEN || !LI_ORG) throw new Error('Faltam os secrets LI_ACCESS_TOKEN e LI_ORG_URN.');
+  const r = await fetch(`${LI_API}/${caminho}`, {
+    method: metodo,
+    headers: {
+      Authorization: `Bearer ${LI_TOKEN}`, 'LinkedIn-Version': LI_VERSAO, 'X-Restli-Protocol-Version': '2.0.0',
+      ...(corpo ? { 'Content-Type': 'application/json' } : {}), ...extra,
+    },
+    body: corpo ? JSON.stringify(corpo) : undefined,
+  });
+  const texto = await r.text();
+  let j = {};
+  try { j = texto ? JSON.parse(texto) : {}; } catch { /* corpo nao-JSON */ }
+  if (!r.ok) throw new Error(`linkedin ${caminho.split('?')[0]}: HTTP ${r.status} ${j.message || texto.slice(0, 200)}`);
+  return { j, headers: r.headers };
+}
+
+// O texto do post usa o formato "little" do LinkedIn: caractere reservado sem barra invertida corta
+// o texto ou vira marcacao (os parenteses do telefone, o @ do e-mail). Hashtag continua hashtag.
+function littleText(t) {
+  return t.replace(/[\\|{}@[\]()<>#*_~]/g, (c) => '\\' + c).replace(/\\#(?=[\p{L}\p{N}_])/gu, '#');
+}
+
+// Rede de seguranca, como no Instagram: o texto ja esta num post recente da pagina = ja saiu.
+async function jaNoLinkedin(legenda) {
+  const { j } = await li('GET', `posts?author=${encodeURIComponent(LI_ORG)}&q=author&count=10&sortBy=LAST_MODIFIED`,
+    null, { 'X-RestLi-Method': 'FINDER' });
+  const alvos = [legenda.trim(), littleText(legenda).trim()];
+  const p = (j.elements || []).find((e) => alvos.includes((e.commentary || '').trim()));
+  return p ? { id: p.id, permalink: `https://www.linkedin.com/feed/update/${p.id}/` } : null;
+}
+
+async function publicarLinkedin(dir, post) {
+  const { j: init } = await li('POST', 'documents?action=initializeUpload', { initializeUploadRequest: { owner: LI_ORG } });
+  const { uploadUrl, document } = init.value || {};
+  if (!uploadUrl || !document) throw new Error('linkedin documents: initializeUpload sem uploadUrl');
+  const up = await fetch(uploadUrl, { method: 'PUT', headers: { Authorization: `Bearer ${LI_TOKEN}` },
+    body: fs.readFileSync(path.join(dir, post.documento)) });
+  if (!up.ok) throw new Error(`linkedin upload do PDF: HTTP ${up.status}`);
+  for (let i = 0; ; i++) {
+    const { j } = await li('GET', `documents/${encodeURIComponent(document)}`);
+    if (j.status === 'AVAILABLE') break;
+    if (j.status === 'PROCESSING_FAILED') throw new Error('linkedin: processamento do PDF falhou');
+    if (i >= 45) throw new Error(`linkedin: PDF nao ficou disponivel em 3 min (status ${j.status})`);
+    await espera(4000);
+  }
+  const { headers } = await li('POST', 'posts', {
+    author: LI_ORG,
+    commentary: littleText(post.legenda),
+    visibility: 'PUBLIC',
+    distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
+    content: { media: { title: post.titulo, id: document } },
+    lifecycleState: 'PUBLISHED',
+    isReshareDisabledByAuthor: false,
+  });
+  const id = headers.get('x-restli-id');
+  return { media_id: id, permalink: id ? `https://www.linkedin.com/feed/update/${id}/` : null };
 }
 
 async function publicar(pasta, post) {
@@ -120,10 +190,11 @@ async function publicar(pasta, post) {
     if (erro.tentativas >= MAX_TENTATIVAS) continue;
 
     try {
-      const existente = post.tipo === 'story' ? await storyJaNoPerfil(post.publicar_em) : await jaNoPerfil(post.legenda);
+      const existente = post.tipo === 'linkedin' ? await jaNoLinkedin(post.legenda)
+        : post.tipo === 'story' ? await storyJaNoPerfil(post.publicar_em) : await jaNoPerfil(post.legenda);
       const r = existente
         ? { media_id: existente.id, permalink: existente.permalink, recuperado: true }
-        : await publicar(pasta, post);
+        : post.tipo === 'linkedin' ? await publicarLinkedin(dir, post) : await publicar(pasta, post);
       fs.writeFileSync(path.join(dir, 'publicado.json'),
         JSON.stringify({ ...r, publicado_em: new Date().toISOString() }, null, 2) + '\n');
       // Depois de publicado, a imagem ja esta no Instagram: tira os JPEGs do repo.
