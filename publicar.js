@@ -58,6 +58,9 @@ async function aguardarContainer(id, tentativas = 30) {
 async function criarReel(base, post) {
   const params = { media_type: 'REELS', video_url: base + post.video, caption: post.legenda, share_to_feed: 'true' };
   if (post.capa) params.cover_url = base + post.capa;
+  // Trial reel (desde 2026-11-26): vai primeiro para quem nao segue. post.trial = 'SS_PERFORMANCE'
+  // (promove sozinho se performar bem) ou 'MANUAL' (promover pelo app). Doc: IG User Media, trial_params.
+  if (post.trial) params.trial_params = JSON.stringify({ graduation_strategy: post.trial });
   const { id } = await api('POST', `${USER}/media`, params);
   return id;
 }
